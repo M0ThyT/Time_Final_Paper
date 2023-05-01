@@ -1,0 +1,464 @@
+---
+title: "Time_Analysis_NFL_Injuries"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(gridExtra)
+library(lme4)
+library(ggrepel)
+library(nflreadr)
+library(nflplotR)
+library(stringr)
+```
+
+## Reading in Injury data
+
+```{r}
+injuries <- read_csv('/Users/tim/Documents/University/Penn/Courses/Year\ 1/time/Final\ Project/NFL_injuries.csv')
+```
+
+Clean by extracting the week as numeric, filtering out all the positions we don't care about, and creating the version of the name that is eventually going to be used in the function
+
+```{r}
+injuries <- injuries %>% 
+  #keep only positions of interest
+  filter(Position == 'QB' | Position == 'RB'| Position == 'WR') %>%  #| Position == 'TE' 
+  #get the week number of the injury
+  mutate(week = as.numeric(str_extract(Week, '\\d+')), 
+         #Create the name as Initial.Lastname
+         first_initial = str_sub(str_extract(Name, "^\\w+"), 1, 1),
+         last_name = str_extract(Name, "\\w+$"), 
+         Name_short = paste0(first_initial, ".", last_name)) %>% 
+  #get rid of intermediate step variable
+  select(-first_initial, -last_name)
+           
+  
+```
+
+Maybe I should only focus on players that had injuries from after week 3 on, so they have some pre-injury data.
+
+```{r}
+injuries <- injuries %>% filter(week > 3)
+#fix the names for those where it fucked up
+injuries$Name_short[37] <- "T.Marshall"
+injuries$Name_short[39] <- "C.Edwards-Helaire"
+injuries$Name_short[41] <- "J.Smith-Schuster"
+injuries$Name_short[47] <- "T.Jones"
+```
+
+## Reading NFL data
+
+```{r}
+nfl_data<- load_pbp(2021)
+nfl_player_stats <- load_player_stats(2021)
+```
+
+# **Functions for Data Enrichment**
+
+Function that gets the snaps per game. Essentially, I go over the play by play data, and grab the number of plays where a player is on field, and the overall plays of the game where their team is on offense.
+
+```{r}
+per_week_usage_creator <- function(data, namex, teamx, posx){
+  type_x <- ifelse(posx == 'RB', 'run', 'pass') #runningbakcs have run as important play, qbs and wrs have pass
+  #get all plays I care about (pass and rush) and team has possession
+  total_plays <- data %>% filter(home_team == teamx | away_team == teamx) %>% filter(play_type == 'run' | play_type == 'pass') %>% filter(posteam == teamx)
+  #get all snaps per game I care about (TODO: is this both offense and defense? )
+  snaps_all <- total_plays %>% filter(play_type == type_x) %>% group_by(game_id) %>% summarize(snaps = n())
+  
+  #make sure that it looks at rusher, passer, or receiver
+  if(posx == 'RB'){
+    snaps_player <- total_plays %>% filter(play_type == type_x, rusher == namex) %>% group_by(game_id) %>% summarize(snaps = n())
+  } else if(posx == 'WR') {
+    snaps_player <- total_plays %>% filter(play_type == type_x, receiver == namex) %>% group_by(game_id) %>% summarize(snaps = n())
+    
+  } else if(posx == 'QB'){
+    snaps_player <- total_plays %>% filter(play_type == type_x, name == namex) %>% group_by(game_id) %>% summarize(snaps = n())
+  }
+  #merge data
+  total <- merge(snaps_all, snaps_player, by = 'game_id', all.x = T, suffixes = c("_all", "_player"))
+  total[is.na(total)] <- 0 #set missing to 0
+  #create variables I care about
+  total <- total %>% mutate(action_per = snaps_player/snaps_all * 100, #percentage of actually being main player
+                            week = as.integer(substring(game_id, 6,7)))
+  
+  return(total)
+}
+```
+
+## Generate a List of Data frames for each player
+
+I am going over each name on the injury list, and generate a df with all valriables of interest to me. Then I add these variables to a dataframe and store this in a list of data frames. I also store it just in one big dataframe.
+
+```{r}
+df_list = list()
+#small_data <- slice(injuries, 1,3)
+suppressWarnings({
+for (i in 1:nrow(injuries)){
+  #get variables from injury list
+  name <- injuries$Name_short[i]
+  positionx = injuries$Position[i]
+  injury_week = injuries$week[i]
+  injury <- injuries$Injury[i]
+  plyr_dta <- nfl_player_stats %>% filter(player_name == name)
+  #check that it is the right position
+  istrue = plyr_dta$position[1] == positionx
+  if(istrue){
+    #get team 
+  team <- plyr_dta$recent_team
+  } else { #if positions don't match there is two with the same name, so take the wrong one out
+    plyr_dta <- plyr_dta %>% filter(position == positionx)
+    team <- plyr_dta$recent_team
+  }
+  
+  #get TD per game and yards per game
+  for_merger <- plyr_dta %>% mutate(touchdowns = rushing_tds + passing_tds + receiving_tds, 
+                                  yards = passing_yards + receiving_yards + rushing_yards) %>% select(player_name, position, recent_team, week, touchdowns, yards, fantasy_points) #select relevant vars
+
+#generate snap percentage df  
+for_merger_2 <-  per_week_usage_creator(nfl_data, name, team, positionx)
+
+#merge yards and TD with snap percentage
+df_interest <- merge(for_merger, for_merger_2, by = 'week')  
+#add injury week
+df_interest$Injury_week = injury_week
+#add injury indicator (0 before injury, 1 after)
+df_interest <- df_interest %>% mutate(post_injury = case_when(week > Injury_week ~ 1, 
+                                                              TRUE ~0), 
+                                      pre_injury = case_when(week > Injury_week ~ 0, 
+                                                              TRUE ~1))
+#add to list
+df_list <- c(df_list, list(df_interest))
+  
+}
+})
+```
+
+This list of dfs can also be turned into a bigger df quickly
+
+```{r}
+###turn into one df
+
+#create empty df with right vars
+df_big <- data.frame(week = numeric(),
+                 player_name = character(),
+                 position = character(),
+                 recent_team = character(),
+                 touchdowns = numeric(),
+                 yards = numeric(),
+                 fantasy_points = numeric(),
+                 game_id = numeric(),
+                 snaps_all = numeric(),
+                 snaps_player = numeric(),
+                 action_per = numeric(),
+                 Injury_week = numeric(),
+                 post_injury = character(),
+                 stringsAsFactors = FALSE)
+
+for (i in 1:length(df_list)){
+  df_small <- df_list[[i]]
+  df_big <- rbind(df_big, df_small)
+}
+
+```
+
+Taking out players with too little data. Need at least 3 rows before injury, and 3 rows after.
+
+```{r}
+#get rid of the games in which a player didn't play
+df_big <- df_big %>% filter(action_per > 0)
+
+#get names of players that have too little data before or after
+inclusion <- df_big %>% group_by(player_name) %>% 
+  summarize(pre_inj_count = sum(pre_injury), 
+            post_inj_count = sum(post_injury)) %>% 
+  mutate(include = case_when(pre_inj_count > 2 & post_inj_count > 2 ~ 1, 
+                                                                TRUE ~ 0))
+
+sum(inclusion$include) #27 players to include
+
+#add names to exclude names
+exclude_names <- c() #16 names removed for too little data
+for (i in 1:nrow(inclusion)){
+  if (inclusion$include[i] == 0){
+    exclude_names <- c(exclude_names, inclusion$player_name[i])
+  }
+}
+
+df_relevant <- df_big %>% filter(!(player_name %in% exclude_names))
+
+          
+```
+
+I start with 97 different players suffering injuries in the 2021 season, then I delete 35 observations that are not QB, RB, or WR (leaving 62), then I delete another 35 observations for not having data on at least 3 weeks before and after the injury, leaving me with data on 27 different players for me to consider.
+
+# Analysis
+
+## Descriptive
+
+What type of players do I have in terms of position and team.
+
+```{r}
+#Positions
+df_relevant %>% group_by(player_name) %>% slice(1) %>% 
+  ungroup() %>% group_by(position) %>% summarize(count = n()) %>% ggplot(aes(x = "",, y = count, fill = position)) + geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  scale_fill_brewer(palette = "Dark2") +
+  theme_void() +
+  labs(title = "Distribution of Positions", fill = "Position") #+
+ # geom_label_repel(aes(label = count, fill = NULL),
+ #                   position = position_stack(vjust = 0.5))
+ 
+
+  
+```
+
+Mix of positions. 13 RBs, 8 WR's, and 6 QB's
+
+```{r}
+#teams
+df_relevant %>% group_by(player_name) %>% slice(1) %>% 
+  ungroup() %>% group_by(recent_team) %>% summarize(count = n()) %>% arrange(desc(count))
+```
+
+No team unproportionally being represented. 20 different teams (out of 32 total teams), with 3 players being from Philadelphia, and two from Buffalo, Cleavland, Green Bay, the New York Giants, and Seattle
+
+When did the injuries occur
+
+```{r}
+df_relevant %>% group_by(player_name) %>% slice(1) %>% 
+  ungroup() %>% ggplot(aes(x = Injury_week)) +
+  geom_histogram() +   scale_x_continuous(breaks = seq(min(df_relevant$Injury_week), max(df_relevant$Injury_week), by = 1)) + labs(x = "Week of Injury", y = "Number")  +   theme_light()
+  #theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+```
+
+What are the yards per game etc distribution overall and per position group
+
+```{r}
+#overall
+#yards per game
+ypg <- ggplot(df_relevant, aes(x = position, y = yards)) +
+  geom_boxplot() +
+  xlab("Position") +
+  ylab("Yards per game") +
+  geom_boxplot(aes(x = "All", y = yards), fill = "grey") +
+  theme_bw()
+
+#Fantasy Points
+fp <- ggplot(df_relevant, aes(x = position, y = fantasy_points)) +
+  geom_boxplot() +
+  xlab("Position") +
+  ylab("Fantasy Points") +
+  geom_boxplot(aes(x = "All", y = fantasy_points), fill = "grey") +
+  theme_bw()
+
+#snaps
+snaps <- ggplot(df_relevant, aes(x = position, y = action_per)) +
+  geom_boxplot() +
+  xlab("Position") +
+  ylab("Snaps percentage") +
+  geom_boxplot(aes(x = "All", y = action_per), fill = "grey") +
+  theme_bw()
+
+#touch downs
+# Calculate the mean and standard deviation for all positions
+all_mean <- mean(df_relevant$touchdowns)
+all_sd <- sd(df_relevant$touchdowns)
+
+# Create a bar plot with error bars for each position and one for all of them together
+tds <- ggplot(df_relevant, aes(x = position, y = touchdowns)) +
+  stat_summary(fun.y = mean, geom = "bar", fill = "lightblue") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  xlab("Position") +
+  ylab("Touchdowns") +
+  geom_hline(yintercept = mean(df_relevant$touchdowns), linetype="dashed", color = "grey") +
+  
+  theme_bw()
+
+grid.arrange(ypg, snaps, tds, fp, ncol = 2)
+
+```
+
+```{r}
+#Split by injury
+
+# Create a side-by-side bar graph
+#yards
+ypg <- snaps<- df_relevant %>% mutate(inj = case_when(pre_injury == 1 ~ "Pre", 
+                                  TRUE ~ "Post")) %>% 
+  ggplot( aes(x = position, y = yards, fill = inj)) +
+  geom_boxplot() +
+  xlab("Position") +
+  ylab("Yards per game") +
+  scale_fill_manual(values = c("blue", "red"), name = "Injury status") + 
+  theme_bw()
+
+#Fantasy Points
+fp <- snaps<- df_relevant %>% mutate(inj = case_when(pre_injury == 1 ~ "Pre", 
+                                  TRUE ~ "Post")) %>% 
+  ggplot(aes(x = position, y = fantasy_points, fill = inj)) +
+  geom_boxplot() +
+  xlab("Position") +
+  ylab("Fantasy Points") +
+  scale_fill_manual(values = c("blue", "red"), name = "Injury status") + 
+  theme_bw()
+
+
+
+#snaps
+snaps<- df_relevant %>% mutate(inj = case_when(pre_injury == 1 ~ "Pre", 
+                                  TRUE ~ "Post")) %>% 
+  ggplot(aes(x = position, y = action_per, fill = inj)) +
+  geom_boxplot() +
+  xlab("Position") +
+  ylab("Snaps percentage") +
+  scale_fill_manual(values = c("blue", "red"), name = "Injury status") + 
+  theme_bw()
+
+
+#touchdowns
+tds <-df_relevant %>% mutate(inj = case_when(pre_injury == 1 ~ "Pre", 
+                                  TRUE ~ "Post")) %>% 
+  ggplot(aes(x = position, y = touchdowns, fill = inj)) +
+  geom_bar(position = position_dodge(), stat = "summary", fun = mean) +
+  xlab("Position") +
+  ylab("Touchdowns (mean)") +
+  scale_fill_manual(values = c("blue", "red"), name = "Injury status") +
+  theme_bw()
+
+grid.arrange(ypg, snaps, tds, fp, ncol = 2)
+```
+
+This does not really show the paired nature of the data, so difficult to say anything about whether differences are significant.
+
+## Parametric
+
+Yards per game (TTest)
+
+```{r}
+#ttest yards per game
+# Group the data by player and injury status
+df_grouped <- df_relevant %>%
+  group_by(player_name, post_injury) %>%
+  summarise(mean_yards = mean(yards), 
+            mean_snap_per = mean(action_per), 
+            mean_fp = mean(fantasy_points),
+            .groups = "drop_last") 
+
+
+overall_yards <- t.test(df_grouped$mean_yards ~ df_grouped$post_injury, paired = TRUE)
+overall_snap_per <- t.test(df_grouped$mean_snap_per ~ df_grouped$post_injury, paired = TRUE)
+overall_fp <- t.test(df_grouped$mean_fp ~ df_grouped$post_injury, paired = TRUE)
+
+#per position
+#qb
+df_grouped_qb <- df_relevant %>% filter(position == 'QB') %>% 
+  group_by(player_name, post_injury) %>%
+  summarise(mean_yards = mean(yards), 
+            mean_snap_per = mean(action_per), 
+            mean_fp = mean(fantasy_points),
+            .groups = "drop_last") 
+
+qb_yards <- t.test(df_grouped_qb$mean_yards ~ df_grouped_qb$post_injury, paired = TRUE)
+qb_snap_per <- t.test(df_grouped_qb$mean_snap_per ~ df_grouped_qb$post_injury, paired = TRUE)
+qb_fp <- t.test(df_grouped_qb$mean_fp ~ df_grouped_qb$post_injury, paired = TRUE)
+
+#rb
+df_grouped_rb <- df_relevant %>% filter(position == 'RB') %>% 
+  group_by(player_name, post_injury) %>%
+  summarise(mean_yards = mean(yards), 
+            mean_snap_per = mean(action_per), 
+            mean_fp = mean(fantasy_points),
+            .groups = "drop_last") 
+
+rb_yards <- t.test(df_grouped_rb$mean_yards ~ df_grouped_rb$post_injury, paired = TRUE)
+rb_snap_per <- t.test(df_grouped_rb$mean_snap_per ~ df_grouped_rb$post_injury, paired = TRUE)
+rb_fp <- t.test(df_grouped_rb$mean_fp ~ df_grouped_rb$post_injury, paired = TRUE)
+
+
+#wr
+df_grouped_wr <- df_relevant %>% filter(position == 'WR') %>% 
+  group_by(player_name, post_injury) %>%
+  summarise(mean_yards = mean(yards), 
+            mean_snap_per = mean(action_per), 
+            mean_fp = mean(fantasy_points),
+            .groups = "drop_last") 
+
+wr_yards <- t.test(df_grouped_wr$mean_yards ~ df_grouped_wr$post_injury, paired = TRUE)
+wr_snap_per <- t.test(df_grouped_wr$mean_snap_per ~ df_grouped_wr$post_injury, paired = TRUE)
+wr_fp <- t.test(df_grouped_wr$mean_fp ~ df_grouped_wr$post_injury, paired = TRUE)
+
+
+
+```
+
+```{r}
+wr_fp
+```
+
+Regression analysis of the effect of the different variables, build up fron normal regression to adding an intercept per player and a slope per position group.
+
+```{r}
+#No random
+yards_no_random <-lm(data = df_relevant, formula = yards ~ position + post_injury)
+#random intercept per player
+yards_random_int <- lmer(yards ~ position + post_injury + (1|player_name), data = df_relevant)
+#random slope per position
+yards_random_slope <- lmer(data = df_relevant, formula = yards ~ position + post_injury + (1 + position|player_name))
+
+
+```
+
+```{r}
+summary(yards_random_slope)
+```
+
+## Non-Parametric
+
+Wilcoxon rank sum test
+
+```{r}
+#overall 
+df_grouped <- df_relevant %>%
+  group_by(player_name, post_injury) %>%
+  summarise(median_td = median(yards),
+            .groups = "drop_last") 
+
+overall_td <- wilcox.test(df_grouped$median_td ~ df_grouped$post_injury, paired = TRUE)
+
+#qb
+df_grouped <- df_relevant %>% filter(position == "QB") %>% 
+  group_by(player_name, post_injury) %>%
+  summarise(median_td = median(yards),
+            .groups = "drop_last") 
+
+qb_td <- wilcox.test(df_grouped$median_td ~ df_grouped$post_injury, paired = TRUE)
+
+#rb
+df_grouped <- df_relevant %>% filter(position == "RB") %>% 
+  group_by(player_name, post_injury) %>%
+  summarise(median_td = median(yards),
+            .groups = "drop_last") 
+
+rb_td <- wilcox.test(df_grouped$median_td ~ df_grouped$post_injury, paired = TRUE)
+
+#wr
+df_grouped <- df_relevant %>% filter(position == "WR") %>% 
+  group_by(player_name, post_injury) %>%
+  summarise(median_td = median(yards),
+            .groups = "drop_last") 
+
+wr_td <- wilcox.test(df_grouped$median_td ~ df_grouped$post_injury, paired = TRUE)
+
+
+
+
+```
+
+```{r}
+wr_td
+```
